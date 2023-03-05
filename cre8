@@ -1,0 +1,191 @@
+#!/bin/bash
+if (( $# == 0 )); then
+    echo "syntax: cre8 <project-name>"
+    exit
+fi
+
+# CHANGE AS NEEDED =============================
+
+projectroot=~/ws
+pyver=3.11.1
+
+# end ==========================================
+
+if [ -d "$projectroot/$1" ]; then
+  echo "$projectroot/$1 already exists."
+  exit
+fi
+
+if ! command -v putup &> /dev/null ;
+then
+    echo "must pip install pyscaffold in the active venv; can't continue."
+    echo "Recommend installing putup with pipx."
+    exit
+fi
+
+if ! command -v gh &> /dev/null ;
+then
+    echo "gh, the github client, must be installed so I can create  the origin repo."
+    exit
+fi
+
+if ! command -v pyenv &> /dev/null ;
+then
+    echo "pyenv must be installed so I can create the project."
+    echo "pyenv virtualenv is also required, and it must be setup correctly"
+    echo "in the shell startups."
+    exit
+fi
+
+echo ""
+echo "NOTE:"
+echo "This creates a public repo. You can change on github."
+echo "This script sets up github actions that will automatically build"
+echo "and deploy to PyPi, and another to build and test the app."
+echo "These are 'turned off', by adding the .github folder to the .gitignore"
+echo "The PyPi deployment file only requires you to setup authentication."
+echo "Remove from .gitignore to execute."
+echo ""
+echo ""
+
+cd $projectroot
+putup --no-skeleton $1
+cd $1
+pyenv virtualenv $pyver $1
+pyenv local $1
+cd ../$1 # activate
+
+echo .github/ >> .gitignore
+
+gh repo create $1 --public --source=. --remote=origin
+git add . && git commit -m "init from cre8 script" && git push origin master
+
+python -m pip install --upgrade pip &> /dev/null
+python -m pip install pytest pytest-cov pytest-bdd tox &> /dev/null
+mkdir -p .github/workflows
+touch .github/workflows/build.yml 
+touch .github/workflows/pypi.yml 
+touch Dockerfile 
+cat >> .github/workflows/build.yml << 'END'
+name: Python package
+
+on: [push]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Lint with flake8
+        run: |
+          # stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      - name: Test with pytest
+        run: |
+          pytest
+END
+cat >> .github/workflows/pypi.yml << 'END'
+name: Publish Python distributions to PyPI and TestPyPI
+
+on: push
+
+jobs:
+  build-n-publish:
+    name: Build and publish Python distributions to PyPI and TestPyPI
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.11"
+    - name: Install pypa/build
+      run: >-
+        python -m
+        pip install
+        build
+        --user
+    - name: Build a binary wheel and a source tarball
+      run: >-
+        python -m
+        build
+        --sdist
+        --wheel
+        --outdir dist/
+        .
+    - name: Publish distribution to Test PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        username: __token__
+        password: ${{ secrets.TEST_PYPI_PASSWORD }}
+        repository_url: https://test.pypi.org/legacy/
+#    - name: Publish distribution to PyPI
+#      if: startsWith(github.ref, 'refs/tags')
+#      uses: pypa/gh-action-pypi-publish@release/v1
+#      with:
+#        password: ${{ secrets.PYPI_API_TOKEN }} 
+# delete comments for prod
+#
+
+END
+cat >> Dockerfile << 'END'
+FROM python:3.11-slim-bullseye
+RUN apt-get update && apt-get install -y zsh 
+SHELL ["/bin/zsh", "-c", "-o", "pipefail"]
+
+RUN if ! getent passwd app; then groupadd -g 1000 app \
+    && useradd -u 1000 -g 1000 -d /home/app -m -s /bin/zsh app; fi \
+    && echo app:app | chpasswd \
+    && echo 'app ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \
+    && mkdir -p /etc/sudoers.d \
+    && echo 'app ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/app \
+    && chmod 0440 /etc/sudoers.d/app \
+    && apt-get autoremove \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/* 
+
+USER app
+WORKDIR /home/app
+
+RUN touch /home/app/.zshrc \
+   && echo 'PS1="$ "' >> /home/app/.zshrc \
+   && echo 'export PATH=/home/app/.local/bin:$PATH' >> /home/app/.zshrc
+
+RUN \
+    source /home/app/.zshrc \
+    && mkdir -p /home/app/app \
+    && mkdir -p /home/app/app/tests \
+    && mkdir -p /home/app/app/docs \
+    && mkdir -p /home/app/data
+
+ENV PATH="/home/app/local/bin:${PATH}"
+ENV COLORTERM=truecolor
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /home/app/app
+RUN python -m pip install --user --upgrade pip
+COPY --chown=app requirements.txt .
+COPY --chown=app requirements.dev.txt .
+RUN python -m pip install --user -r requirements.txt
+RUN python -m pip install --user -r requirements.dev.txt
+COPY --chown=app app/ /home/app/app/app
+COPY --chown=app tests/ /home/app/app/tests/
+END
+
+echo "You can now open this project"
